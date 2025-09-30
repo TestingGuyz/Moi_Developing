@@ -1,0 +1,26 @@
+# Core Web Framework
+flask==3.0.0
+flask-cors==4.0.0
+
+# AI and ML Libraries
+torch==2.1.0
+transformers==4.36.0
+accelerate==0.25.0
+
+# Vision and Image Processing
+opencv-python==4.8.1.78
+Pillow==10.1.0
+
+# API Clients
+groq==0.4.1
+tavily-python==0.3.3
+
+# Utilities
+python-dotenv==1.0.0
+requests==2.31.0
+
+# Database (included in Python standard library)
+# sqlite3 - built-in
+
+# Optional - For GPU support
+# Install with: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118

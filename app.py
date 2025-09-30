@@ -19,6 +19,11 @@ from dotenv import load_dotenv
 import threading
 import time
 
+# Import new modules
+from knowledge_database import KnowledgeDatabase
+from agentic_ai import AgenticSystem
+from image_generation import ImageGenerator
+
 # Load environment variables
 load_dotenv()
 
@@ -30,6 +35,26 @@ class AIAssistant:
         # Initialize API clients
         self.groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
         self.tavily_client = TavilyClient(api_key=os.getenv('TAVILY_API_KEY'))
+        
+        # Initialize Knowledge Database
+        self.knowledge_db = KnowledgeDatabase()
+        
+        # Initialize Image Generator
+        self.image_generator = ImageGenerator()
+        
+        # Initialize Agentic AI System
+        self.agentic_system = AgenticSystem(
+            knowledge_db=self.knowledge_db,
+            tavily_api_key=os.getenv('TAVILY_API_KEY'),
+            groq_api_key=os.getenv('GROQ_API_KEY')
+        )
+        
+        # Start all autonomous agents
+        try:
+            self.agentic_system.start_all_agents()
+            print("✅ Agentic AI systems started successfully")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not start all agentic systems: {e}")
         
         # Initialize vision models
         self.setup_vision_models()
@@ -401,17 +426,37 @@ class AIAssistant:
                 # Use GPT OSS 120B to extract specific description for this object
                 specific_description = self.extract_object_description_with_gpt(scene_description, class_name, image)
                 
+                # Store/update object in knowledge database
+                self.store_detected_object(class_name, specific_description, detection['confidence'])
+                
+                # Queue for info gathering if new or rarely seen
+                obj_info = self.knowledge_db.get_object(class_name)
+                if not obj_info or obj_info.get('times_seen', 0) <= 3:
+                    self.agentic_system.info_gatherer.queue_object_for_research(class_name, specific_description)
+                
                 enhanced_detections.append({
                     **detection,
                     'color': color,
                     'description': specific_description,
-                    'id': f"obj_{i}"
+                    'id': f"obj_{i}",
+                    'knowledge': obj_info
                 })
             
             return enhanced_detections
         except Exception as e:
             print(f"Enhanced object detection error: {e}")
             return []
+    
+    def store_detected_object(self, object_name: str, description: str, confidence: float):
+        """Store detected object in knowledge database"""
+        try:
+            self.knowledge_db.add_object(
+                name=object_name,
+                description=description,
+                confidence_score=confidence
+            )
+        except Exception as e:
+            print(f"Error storing object: {e}")
     
     def extract_object_description_with_gpt(self, scene_description, object_class, image):
         """Use GPT OSS 120B to extract specific description for an object"""
@@ -1002,6 +1047,228 @@ def search_object():
             'query': query,
             'summary': summary,
             'results': formatted_results
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========== NEW ENDPOINTS FOR ENHANCED FEATURES ==========
+
+@app.route('/generate-image', methods=['POST'])
+def generate_image():
+    """Generate image from text prompt"""
+    try:
+        data = request.json
+        prompt = data.get('prompt', '')
+        size = data.get('size', '512x512')
+        backend = data.get('backend', 'auto')
+        
+        if not prompt:
+            return jsonify({'error': 'No prompt provided'}), 400
+        
+        # Generate image
+        image_base64 = ai_assistant.image_generator.generate_and_encode(prompt, backend, size)
+        
+        if image_base64:
+            return jsonify({
+                'success': True,
+                'image': image_base64,
+                'prompt': prompt,
+                'backend': backend
+            })
+        else:
+            return jsonify({'error': 'Image generation failed'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/objects', methods=['GET'])
+def get_all_objects():
+    """Get all objects from knowledge database"""
+    try:
+        limit = int(request.args.get('limit', 100))
+        objects = ai_assistant.knowledge_db.get_all_objects(limit=limit)
+        return jsonify({'objects': objects, 'count': len(objects)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/object/<object_name>', methods=['GET'])
+def get_object_info(object_name):
+    """Get detailed information about a specific object"""
+    try:
+        obj_info = ai_assistant.knowledge_db.get_object(object_name)
+        if obj_info:
+            return jsonify(obj_info)
+        else:
+            return jsonify({'error': 'Object not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/object', methods=['POST'])
+def add_or_update_object():
+    """Add or update object information (User Teaching Interface)"""
+    try:
+        data = request.json
+        object_name = data.get('name', '')
+        
+        if not object_name:
+            return jsonify({'error': 'Object name is required'}), 400
+        
+        # Extract fields
+        description = data.get('description', '')
+        color = data.get('color', '')
+        climate = data.get('climate', '')
+        types = data.get('types', '')
+        category = data.get('category', '')
+        user_notes = data.get('user_notes', '')
+        
+        # Add or update object
+        object_id = ai_assistant.knowledge_db.add_object(
+            name=object_name,
+            description=description,
+            color=color,
+            climate=climate,
+            types=types,
+            category=category,
+            user_notes=user_notes
+        )
+        
+        # Add custom properties if provided
+        properties = data.get('properties', {})
+        for key, value in properties.items():
+            ai_assistant.knowledge_db.add_property(object_name, key, value, source='user')
+        
+        return jsonify({
+            'success': True,
+            'object_id': object_id,
+            'message': f'Object "{object_name}" saved successfully'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/object/<object_name>', methods=['DELETE'])
+def delete_object(object_name):
+    """Delete object from knowledge database"""
+    try:
+        ai_assistant.knowledge_db.delete_object(object_name)
+        return jsonify({'success': True, 'message': f'Object "{object_name}" deleted'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/search', methods=['GET'])
+def search_knowledge():
+    """Search knowledge database"""
+    try:
+        query = request.args.get('query', '')
+        category = request.args.get('category', '')
+        limit = int(request.args.get('limit', 10))
+        
+        results = ai_assistant.knowledge_db.search_objects(
+            query=query if query else None,
+            category=category if category else None,
+            limit=limit
+        )
+        
+        return jsonify({'results': results, 'count': len(results)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/statistics', methods=['GET'])
+def get_knowledge_statistics():
+    """Get knowledge database statistics"""
+    try:
+        stats = ai_assistant.knowledge_db.get_statistics()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/export', methods=['GET'])
+def export_knowledge():
+    """Export knowledge database to JSON"""
+    try:
+        file_path = ai_assistant.knowledge_db.export_knowledge()
+        return jsonify({
+            'success': True,
+            'file_path': file_path,
+            'message': 'Knowledge exported successfully'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/agentic/status', methods=['GET'])
+def get_agentic_status():
+    """Get status of all agentic AI systems"""
+    try:
+        status = ai_assistant.agentic_system.get_status()
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/agentic/secret-model/generate', methods=['POST'])
+def secret_model_generate():
+    """Generate response using the secret model"""
+    try:
+        data = request.json
+        prompt = data.get('prompt', '')
+        max_length = data.get('max_length', 100)
+        
+        if not prompt:
+            return jsonify({'error': 'No prompt provided'}), 400
+        
+        response = ai_assistant.agentic_system.secret_trainer.generate_response(prompt, max_length)
+        
+        return jsonify({
+            'prompt': prompt,
+            'response': response
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/chat-with-memory', methods=['POST'])
+def chat_with_memory():
+    """Enhanced chat that uses knowledge database for context"""
+    try:
+        data = request.json
+        user_message = data.get('message', '')
+        chat_history = data.get('history', [])
+        
+        # Extract potential object names from message
+        words = user_message.lower().split()
+        context_info = []
+        
+        for word in words:
+            obj_info = ai_assistant.knowledge_db.get_object(word)
+            if obj_info:
+                context_info.append(f"I know about {word}: {obj_info.get('description', '')}")
+        
+        # Add context to message
+        if context_info:
+            enhanced_message = f"{user_message}\n\n[Context from my memory: {' '.join(context_info)}]"
+        else:
+            enhanced_message = user_message
+        
+        # Prepare messages
+        messages = []
+        for msg in chat_history[-10:]:
+            messages.append({"role": msg['role'], "content": msg['content']})
+        messages.append({"role": "user", "content": enhanced_message})
+        
+        # Get response
+        response = ai_assistant.chat_with_groq(messages)
+        
+        # Store conversation as training data
+        ai_assistant.knowledge_db.add_training_data(
+            input_text=user_message,
+            output_text=response,
+            context=json.dumps(chat_history[-3:]),
+            quality_score=0.7
+        )
+        
+        return jsonify({
+            'response': response,
+            'context_used': len(context_info) > 0,
+            'timestamp': datetime.now().isoformat()
         })
         
     except Exception as e:
