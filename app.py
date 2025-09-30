@@ -1,3 +1,16 @@
+"""
+Moi AI Assistant - Complete Implementation
+A self-learning AI with vision, memory, and autonomous agents
+
+All components integrated in single file:
+- Vision Model (BLIP + NVIDIA Vision API)
+- Object Detection (YOLOv5)
+- Knowledge Database (SQLite)
+- Agentic AI Systems (3 autonomous agents)
+- Image Generation (Multiple backends)
+- Generative Chat (Groq API)
+"""
+
 import os
 import json
 import base64
@@ -6,29 +19,1152 @@ import numpy as np
 import requests
 import re
 import html
+import sqlite3
+import logging
+import urllib.parse
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from groq import Groq
 from tavily import TavilyClient
-from transformers import BlipProcessor, BlipForConditionalGeneration, pipeline
+from transformers import (
+    BlipProcessor, 
+    BlipForConditionalGeneration, 
+    AutoTokenizer, 
+    AutoModelForCausalLM, 
+    Trainer, 
+    TrainingArguments, 
+    TextDataset, 
+    DataCollatorForLanguageModeling
+)
 import torch
 from PIL import Image
 import io
 from dotenv import load_dotenv
 import threading
 import time
+from typing import Dict, List, Optional, Any
 
-# Import new modules
-from knowledge_database import KnowledgeDatabase
-from agentic_ai import AgenticSystem
-from image_generation import ImageGenerator
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+
+# ==================== KNOWLEDGE DATABASE ====================
+
+class KnowledgeDatabase:
+    """
+    Knowledge Database System
+    Stores and manages learned object information with full CRUD operations
+    """
+    
+    def __init__(self, db_path: str = "moi_knowledge.db"):
+        """Initialize the knowledge database"""
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._initialize_database()
+    
+    def _initialize_database(self):
+        """Create database tables if they don't exist"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Main objects table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS objects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    description TEXT,
+                    color TEXT,
+                    climate TEXT,
+                    types TEXT,
+                    category TEXT,
+                    confidence_score REAL DEFAULT 0.0,
+                    times_seen INTEGER DEFAULT 1,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    user_notes TEXT,
+                    metadata TEXT
+                )
+            ''')
+            
+            # Object properties table (key-value pairs)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS object_properties (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    object_id INTEGER,
+                    property_key TEXT NOT NULL,
+                    property_value TEXT,
+                    source TEXT,
+                    added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (object_id) REFERENCES objects(id) ON DELETE CASCADE
+                )
+            ''')
+            
+            # Learning history table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS learning_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    object_id INTEGER,
+                    event_type TEXT,
+                    event_data TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (object_id) REFERENCES objects(id) ON DELETE CASCADE
+                )
+            ''')
+            
+            # Training data table for secret model
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS training_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    input_text TEXT,
+                    output_text TEXT,
+                    context TEXT,
+                    quality_score REAL DEFAULT 0.0,
+                    used_for_training BOOLEAN DEFAULT 0,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+    
+    def add_object(self, name: str, **kwargs) -> int:
+        """Add a new object to the database or update if exists"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Check if object exists
+            cursor.execute('SELECT id, times_seen FROM objects WHERE name = ?', (name,))
+            result = cursor.fetchone()
+            
+            if result:
+                # Update existing object
+                object_id, times_seen = result
+                update_fields = []
+                update_values = []
+                
+                for key, value in kwargs.items():
+                    if key in ['description', 'color', 'climate', 'types', 'category', 'user_notes', 'confidence_score']:
+                        update_fields.append(f"{key} = ?")
+                        update_values.append(value)
+                
+                update_fields.append("times_seen = ?")
+                update_values.append(times_seen + 1)
+                update_fields.append("last_seen = ?")
+                update_values.append(datetime.now().isoformat())
+                
+                if update_fields:
+                    update_values.append(object_id)
+                    cursor.execute(f'''
+                        UPDATE objects 
+                        SET {', '.join(update_fields)}
+                        WHERE id = ?
+                    ''', update_values)
+                
+                conn.commit()
+                conn.close()
+                return object_id
+            else:
+                # Insert new object
+                fields = ['name']
+                values = [name]
+                
+                for key in ['description', 'color', 'climate', 'types', 'category', 'user_notes', 'confidence_score']:
+                    if key in kwargs:
+                        fields.append(key)
+                        values.append(kwargs[key])
+                
+                placeholders = ','.join(['?' for _ in values])
+                cursor.execute(f'''
+                    INSERT INTO objects ({','.join(fields)})
+                    VALUES ({placeholders})
+                ''', values)
+                
+                object_id = cursor.lastrowid
+                
+                # Log learning event
+                cursor.execute('''
+                    INSERT INTO learning_history (object_id, event_type, event_data)
+                    VALUES (?, ?, ?)
+                ''', (object_id, 'object_learned', json.dumps(kwargs)))
+                
+                conn.commit()
+                conn.close()
+                return object_id
+    
+    def get_object(self, name: str) -> Optional[Dict[str, Any]]:
+        """Retrieve object information by name"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT * FROM objects WHERE name = ?', (name,))
+            result = cursor.fetchone()
+            
+            if result:
+                object_dict = dict(result)
+                object_id = object_dict['id']
+                
+                # Get additional properties
+                cursor.execute('SELECT property_key, property_value, source FROM object_properties WHERE object_id = ?', (object_id,))
+                properties = cursor.fetchall()
+                object_dict['properties'] = {row['property_key']: {'value': row['property_value'], 'source': row['source']} for row in properties}
+                
+                conn.close()
+                return object_dict
+            
+            conn.close()
+            return None
+    
+    def add_property(self, object_name: str, property_key: str, property_value: str, source: str = 'user'):
+        """Add a property to an object"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get object ID
+            cursor.execute('SELECT id FROM objects WHERE name = ?', (object_name,))
+            result = cursor.fetchone()
+            
+            if result:
+                object_id = result[0]
+                
+                # Check if property exists
+                cursor.execute('''
+                    SELECT id FROM object_properties 
+                    WHERE object_id = ? AND property_key = ?
+                ''', (object_id, property_key))
+                
+                if cursor.fetchone():
+                    # Update existing property
+                    cursor.execute('''
+                        UPDATE object_properties 
+                        SET property_value = ?, source = ?, added_date = ?
+                        WHERE object_id = ? AND property_key = ?
+                    ''', (property_value, source, datetime.now().isoformat(), object_id, property_key))
+                else:
+                    # Insert new property
+                    cursor.execute('''
+                        INSERT INTO object_properties (object_id, property_key, property_value, source)
+                        VALUES (?, ?, ?, ?)
+                    ''', (object_id, property_key, property_value, source))
+                
+                conn.commit()
+            
+            conn.close()
+    
+    def update_object(self, name: str, **kwargs):
+        """Update object information"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            update_fields = []
+            update_values = []
+            
+            for key, value in kwargs.items():
+                if key in ['description', 'color', 'climate', 'types', 'category', 'user_notes', 'confidence_score']:
+                    update_fields.append(f"{key} = ?")
+                    update_values.append(value)
+            
+            if update_fields:
+                update_fields.append("last_seen = ?")
+                update_values.append(datetime.now().isoformat())
+                update_values.append(name)
+                
+                cursor.execute(f'''
+                    UPDATE objects 
+                    SET {', '.join(update_fields)}
+                    WHERE name = ?
+                ''', update_values)
+                
+                conn.commit()
+            
+            conn.close()
+    
+    def search_objects(self, query: str = None, category: str = None, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search objects by query or category"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            if query:
+                cursor.execute('''
+                    SELECT * FROM objects 
+                    WHERE name LIKE ? OR description LIKE ? OR category LIKE ?
+                    ORDER BY times_seen DESC, last_seen DESC
+                    LIMIT ?
+                ''', (f'%{query}%', f'%{query}%', f'%{query}%', limit))
+            elif category:
+                cursor.execute('''
+                    SELECT * FROM objects 
+                    WHERE category = ?
+                    ORDER BY times_seen DESC, last_seen DESC
+                    LIMIT ?
+                ''', (category, limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM objects 
+                    ORDER BY times_seen DESC, last_seen DESC
+                    LIMIT ?
+                ''', (limit,))
+            
+            results = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return results
+    
+    def get_all_objects(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get all objects from database"""
+        return self.search_objects(limit=limit)
+    
+    def delete_object(self, name: str):
+        """Delete an object from database"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM objects WHERE name = ?', (name,))
+            conn.commit()
+            conn.close()
+    
+    def add_training_data(self, input_text: str, output_text: str, context: str = "", quality_score: float = 0.5):
+        """Add training data for the secret model"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO training_data (input_text, output_text, context, quality_score)
+                VALUES (?, ?, ?, ?)
+            ''', (input_text, output_text, context, quality_score))
+            
+            conn.commit()
+            conn.close()
+    
+    def get_training_data(self, unused_only: bool = True, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get training data for model training"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            if unused_only:
+                cursor.execute('''
+                    SELECT * FROM training_data 
+                    WHERE used_for_training = 0 
+                    ORDER BY quality_score DESC, created_date DESC
+                    LIMIT ?
+                ''', (limit,))
+            else:
+                cursor.execute('''
+                    SELECT * FROM training_data 
+                    ORDER BY quality_score DESC, created_date DESC
+                    LIMIT ?
+                ''', (limit,))
+            
+            results = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return results
+    
+    def mark_training_data_used(self, data_ids: List[int]):
+        """Mark training data as used"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            placeholders = ','.join(['?' for _ in data_ids])
+            cursor.execute(f'''
+                UPDATE training_data 
+                SET used_for_training = 1 
+                WHERE id IN ({placeholders})
+            ''', data_ids)
+            
+            conn.commit()
+            conn.close()
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get database statistics"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            stats = {}
+            
+            cursor.execute('SELECT COUNT(*) FROM objects')
+            stats['total_objects'] = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM object_properties')
+            stats['total_properties'] = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM training_data')
+            stats['total_training_data'] = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM training_data WHERE used_for_training = 0')
+            stats['unused_training_data'] = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT SUM(times_seen) FROM objects')
+            stats['total_observations'] = cursor.fetchone()[0] or 0
+            
+            cursor.execute('SELECT name, times_seen FROM objects ORDER BY times_seen DESC LIMIT 5')
+            stats['most_seen_objects'] = [{'name': row[0], 'times_seen': row[1]} for row in cursor.fetchall()]
+            
+            conn.close()
+            return stats
+    
+    def export_knowledge(self, file_path: str = "knowledge_export.json"):
+        """Export all knowledge to JSON file"""
+        objects = self.get_all_objects(limit=10000)
+        stats = self.get_statistics()
+        
+        export_data = {
+            'export_date': datetime.now().isoformat(),
+            'statistics': stats,
+            'objects': objects
+        }
+        
+        with open(file_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+        
+        return file_path
+    
+    def import_knowledge(self, file_path: str):
+        """Import knowledge from JSON file"""
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        objects = data.get('objects', [])
+        for obj in objects:
+            name = obj.pop('name')
+            obj.pop('id', None)  # Remove ID
+            self.add_object(name, **obj)
+
+
+# ==================== IMAGE GENERATOR ====================
+
+class ImageGenerator:
+    """
+    Image generation using multiple backends:
+    1. Together.ai API (Stable Diffusion)
+    2. Pollinations.ai (Free alternative)
+    3. Hugging Face Inference API
+    """
+    
+    def __init__(self):
+        self.together_api_key = os.getenv('TOGETHER_API_KEY')
+        self.hf_api_key = os.getenv('HUGGINGFACE_TOKEN')
+        self.available_backends = self._check_available_backends()
+        
+        logger.info(f"Image generator initialized. Available backends: {self.available_backends}")
+    
+    def _check_available_backends(self) -> list:
+        """Check which image generation backends are available"""
+        backends = ['pollinations']  # Always available (free)
+        
+        if self.together_api_key:
+            backends.append('together')
+        
+        if self.hf_api_key:
+            backends.append('huggingface')
+        
+        return backends
+    
+    def generate_image(self, prompt: str, backend: str = 'auto', size: str = '512x512') -> Optional[bytes]:
+        """Generate image from text prompt"""
+        
+        if backend == 'auto':
+            # Try backends in order of preference
+            for backend_name in self.available_backends:
+                try:
+                    return self._generate_with_backend(prompt, backend_name, size)
+                except Exception as e:
+                    logger.warning(f"Backend {backend_name} failed: {e}")
+                    continue
+            
+            logger.error("All backends failed")
+            return None
+        else:
+            return self._generate_with_backend(prompt, backend, size)
+    
+    def _generate_with_backend(self, prompt: str, backend: str, size: str) -> Optional[bytes]:
+        """Generate image with specific backend"""
+        
+        if backend == 'together':
+            return self._generate_together(prompt, size)
+        elif backend == 'huggingface':
+            return self._generate_huggingface(prompt, size)
+        elif backend == 'pollinations':
+            return self._generate_pollinations(prompt, size)
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
+    
+    def _generate_together(self, prompt: str, size: str) -> Optional[bytes]:
+        """Generate image using Together.ai API"""
+        try:
+            if not self.together_api_key:
+                raise ValueError("Together.ai API key not found")
+            
+            logger.info(f"Generating image with Together.ai: {prompt[:50]}...")
+            
+            # Parse size
+            width, height = map(int, size.split('x'))
+            
+            url = "https://api.together.xyz/v1/images/generations"
+            headers = {
+                "Authorization": f"Bearer {self.together_api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": "stabilityai/stable-diffusion-xl-base-1.0",
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "steps": 30,
+                "n": 1
+            }
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            # Get image URL or base64
+            if 'data' in result and len(result['data']) > 0:
+                image_data = result['data'][0]
+                
+                if 'url' in image_data:
+                    # Download image from URL
+                    img_response = requests.get(image_data['url'], timeout=30)
+                    img_response.raise_for_status()
+                    return img_response.content
+                elif 'b64_json' in image_data:
+                    # Decode base64
+                    return base64.b64decode(image_data['b64_json'])
+            
+            raise ValueError("No image data in response")
+            
+        except Exception as e:
+            logger.error(f"Together.ai error: {e}")
+            raise
+    
+    def _generate_huggingface(self, prompt: str, size: str) -> Optional[bytes]:
+        """Generate image using Hugging Face Inference API"""
+        try:
+            if not self.hf_api_key:
+                raise ValueError("Hugging Face API key not found")
+            
+            logger.info(f"Generating image with Hugging Face: {prompt[:50]}...")
+            
+            API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1"
+            headers = {"Authorization": f"Bearer {self.hf_api_key}"}
+            
+            payload = {
+                "inputs": prompt,
+                "parameters": {
+                    "num_inference_steps": 50,
+                    "guidance_scale": 7.5
+                }
+            }
+            
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            
+            return response.content
+            
+        except Exception as e:
+            logger.error(f"Hugging Face error: {e}")
+            raise
+    
+    def _generate_pollinations(self, prompt: str, size: str) -> Optional[bytes]:
+        """Generate image using Pollinations.ai (free service)"""
+        try:
+            logger.info(f"Generating image with Pollinations.ai: {prompt[:50]}...")
+            
+            # Parse size
+            width, height = map(int, size.split('x'))
+            
+            # Encode prompt for URL
+            encoded_prompt = urllib.parse.quote(prompt)
+            
+            url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true"
+            
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            
+            return response.content
+            
+        except Exception as e:
+            logger.error(f"Pollinations.ai error: {e}")
+            raise
+    
+    def save_image(self, image_bytes: bytes, output_path: str):
+        """Save image bytes to file"""
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            image.save(output_path)
+            logger.info(f"Image saved to {output_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving image: {e}")
+            return False
+    
+    def image_to_base64(self, image_bytes: bytes) -> str:
+        """Convert image bytes to base64 string"""
+        return base64.b64encode(image_bytes).decode('utf-8')
+    
+    def generate_and_encode(self, prompt: str, backend: str = 'auto', size: str = '512x512') -> Optional[str]:
+        """Generate image and return as base64 string"""
+        try:
+            image_bytes = self.generate_image(prompt, backend, size)
+            if image_bytes:
+                return self.image_to_base64(image_bytes)
+            return None
+        except Exception as e:
+            logger.error(f"Error generating and encoding image: {e}")
+            return None
+
+
+# ==================== AGENTIC AI SYSTEMS ====================
+
+class SecretModelTrainer:
+    """
+    Agentic AI #1 - Secret Model Trainer
+    Continuously trains a local generative model using collected training data
+    """
+    
+    def __init__(self, knowledge_db: KnowledgeDatabase, model_name: str = "gpt2"):
+        self.knowledge_db = knowledge_db
+        self.model_name = model_name
+        self.model = None
+        self.tokenizer = None
+        self.is_training = False
+        self.training_thread = None
+        self.training_enabled = True
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Load or initialize model
+        self._initialize_model()
+    
+    def _initialize_model(self):
+        """Initialize or load the secret model"""
+        try:
+            model_path = "models/secret_model"
+            
+            if os.path.exists(model_path):
+                logger.info(f"Loading existing secret model from {model_path}")
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+                self.model = AutoModelForCausalLM.from_pretrained(model_path)
+            else:
+                logger.info(f"Initializing new secret model: {self.model_name}")
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+                
+                # Set pad token if not exists
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            self.model.to(self.device)
+            logger.info(f"✅ Secret model initialized on {self.device}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error initializing secret model: {e}")
+            self.model = None
+            self.tokenizer = None
+    
+    def start_training_loop(self, interval: int = 3600):
+        """Start continuous training loop in background"""
+        if self.training_thread and self.training_thread.is_alive():
+            logger.warning("Training loop already running")
+            return
+        
+        self.training_enabled = True
+        self.training_thread = threading.Thread(
+            target=self._training_loop,
+            args=(interval,),
+            daemon=True
+        )
+        self.training_thread.start()
+        logger.info(f"✅ Secret model training loop started (interval: {interval}s)")
+    
+    def stop_training_loop(self):
+        """Stop the training loop"""
+        self.training_enabled = False
+        if self.training_thread:
+            self.training_thread.join(timeout=5)
+        logger.info("Secret model training loop stopped")
+    
+    def _training_loop(self, interval: int):
+        """Continuous training loop"""
+        while self.training_enabled:
+            try:
+                # Get new training data
+                training_data = self.knowledge_db.get_training_data(unused_only=True, limit=100)
+                
+                if len(training_data) >= 10:  # Train only if we have enough data
+                    logger.info(f"Starting training with {len(training_data)} new examples")
+                    self._train_on_data(training_data)
+                    
+                    # Mark data as used
+                    data_ids = [d['id'] for d in training_data]
+                    self.knowledge_db.mark_training_data_used(data_ids)
+                    
+                    # Save model
+                    self._save_model()
+                else:
+                    logger.info(f"Not enough training data ({len(training_data)} examples)")
+                
+            except Exception as e:
+                logger.error(f"Error in training loop: {e}")
+            
+            # Wait for next iteration
+            time.sleep(interval)
+    
+    def _train_on_data(self, training_data: List[Dict[str, Any]]):
+        """Train model on new data"""
+        if not self.model or not self.tokenizer:
+            logger.error("Model not initialized")
+            return
+        
+        try:
+            self.is_training = True
+            
+            # Prepare training texts
+            training_texts = []
+            for item in training_data:
+                # Format: input + output with special tokens
+                text = f"<|input|>{item['input_text']}<|output|>{item['output_text']}<|end|>"
+                training_texts.append(text)
+            
+            # Save to temporary file
+            temp_file = "temp_training_data.txt"
+            with open(temp_file, 'w') as f:
+                f.write('\n'.join(training_texts))
+            
+            # Create dataset
+            train_dataset = TextDataset(
+                tokenizer=self.tokenizer,
+                file_path=temp_file,
+                block_size=128
+            )
+            
+            data_collator = DataCollatorForLanguageModeling(
+                tokenizer=self.tokenizer,
+                mlm=False
+            )
+            
+            # Training arguments
+            training_args = TrainingArguments(
+                output_dir="./models/secret_model_checkpoints",
+                overwrite_output_dir=True,
+                num_train_epochs=3,
+                per_device_train_batch_size=4,
+                save_steps=100,
+                save_total_limit=2,
+                learning_rate=5e-5,
+                warmup_steps=10,
+                logging_steps=10,
+                no_cuda=(self.device.type == 'cpu')
+            )
+            
+            # Train
+            trainer = Trainer(
+                model=self.model,
+                args=training_args,
+                data_collator=data_collator,
+                train_dataset=train_dataset,
+            )
+            
+            trainer.train()
+            
+            # Clean up
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            
+            logger.info("✅ Training completed successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Training error: {e}")
+        finally:
+            self.is_training = False
+    
+    def _save_model(self):
+        """Save the trained model"""
+        try:
+            save_path = "models/secret_model"
+            os.makedirs(save_path, exist_ok=True)
+            
+            self.model.save_pretrained(save_path)
+            self.tokenizer.save_pretrained(save_path)
+            
+            logger.info(f"✅ Secret model saved to {save_path}")
+        except Exception as e:
+            logger.error(f"❌ Error saving model: {e}")
+    
+    def generate_response(self, prompt: str, max_length: int = 100) -> str:
+        """Generate response using the secret model"""
+        if not self.model or not self.tokenizer:
+            return "Secret model not available"
+        
+        try:
+            input_text = f"<|input|>{prompt}<|output|>"
+            inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
+            
+            outputs = self.model.generate(
+                **inputs,
+                max_length=max_length,
+                num_return_sequences=1,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.9
+            )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Extract only the output part
+            if "<|output|>" in response:
+                response = response.split("<|output|>")[1]
+            
+            return response.strip()
+            
+        except Exception as e:
+            logger.error(f"Generation error: {e}")
+            return f"Error generating response: {e}"
+
+
+class InfoGatheringAgent:
+    """
+    Agentic AI #2 - Info Gathering Agent
+    Automatically gathers information about detected objects
+    """
+    
+    def __init__(self, knowledge_db: KnowledgeDatabase, tavily_api_key: str, groq_api_key: str):
+        self.knowledge_db = knowledge_db
+        self.tavily_client = TavilyClient(api_key=tavily_api_key)
+        self.groq_client = Groq(api_key=groq_api_key)
+        self.gathering_queue = []
+        self.queue_lock = threading.Lock()
+        self.worker_thread = None
+        self.is_running = False
+    
+    def start_worker(self):
+        """Start background worker for gathering info"""
+        if self.worker_thread and self.worker_thread.is_alive():
+            logger.warning("Worker already running")
+            return
+        
+        self.is_running = True
+        self.worker_thread = threading.Thread(
+            target=self._worker_loop,
+            daemon=True
+        )
+        self.worker_thread.start()
+        logger.info("✅ Info gathering agent worker started")
+    
+    def stop_worker(self):
+        """Stop the worker"""
+        self.is_running = False
+        if self.worker_thread:
+            self.worker_thread.join(timeout=5)
+        logger.info("Info gathering agent worker stopped")
+    
+    def queue_object_for_research(self, object_name: str, context: str = ""):
+        """Add object to research queue"""
+        with self.queue_lock:
+            self.gathering_queue.append({
+                'object_name': object_name,
+                'context': context,
+                'queued_at': datetime.now().isoformat()
+            })
+        logger.info(f"Queued {object_name} for research")
+    
+    def _worker_loop(self):
+        """Background worker that processes research queue"""
+        while self.is_running:
+            try:
+                item = None
+                with self.queue_lock:
+                    if self.gathering_queue:
+                        item = self.gathering_queue.pop(0)
+                
+                if item:
+                    self._gather_object_info(item['object_name'], item['context'])
+                else:
+                    time.sleep(5)  # Wait if queue is empty
+                    
+            except Exception as e:
+                logger.error(f"Worker loop error: {e}")
+                time.sleep(5)
+    
+    def _gather_object_info(self, object_name: str, context: str = ""):
+        """Gather comprehensive information about an object"""
+        try:
+            logger.info(f"Gathering info for: {object_name}")
+            
+            # Check if already in database
+            existing = self.knowledge_db.get_object(object_name)
+            if existing and existing.get('times_seen', 0) > 5:
+                logger.info(f"{object_name} already well-documented")
+                return
+            
+            # Perform web search
+            search_results = self._web_search(object_name)
+            
+            # Extract structured information using AI
+            structured_info = self._extract_structured_info(object_name, search_results)
+            
+            # Store in database
+            self.knowledge_db.add_object(
+                name=object_name,
+                description=structured_info.get('description', ''),
+                color=structured_info.get('color', ''),
+                climate=structured_info.get('climate', ''),
+                types=structured_info.get('types', ''),
+                category=structured_info.get('category', '')
+            )
+            
+            # Add detailed properties
+            for key, value in structured_info.get('properties', {}).items():
+                self.knowledge_db.add_property(object_name, key, value, source='web_search')
+            
+            logger.info(f"✅ Gathered and stored info for {object_name}")
+            
+        except Exception as e:
+            logger.error(f"Error gathering info for {object_name}: {e}")
+    
+    def _web_search(self, query: str) -> List[Dict[str, Any]]:
+        """Perform web search"""
+        try:
+            response = self.tavily_client.search(
+                query=f"{query} information characteristics properties",
+                search_depth="advanced",
+                max_results=5
+            )
+            return response.get('results', [])
+        except Exception as e:
+            logger.error(f"Web search error: {e}")
+            return []
+    
+    def _extract_structured_info(self, object_name: str, search_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Extract structured information using AI"""
+        try:
+            # Prepare context from search results
+            context = "\n".join([
+                f"- {result.get('title', '')}: {result.get('content', '')[:300]}"
+                for result in search_results[:3]
+            ])
+            
+            prompt = f"""
+            Extract structured information about: {object_name}
+            
+            Search Results:
+            {context}
+            
+            Please provide a JSON response with the following structure:
+            {{
+                "description": "brief description",
+                "color": "typical color(s)",
+                "climate": "climate conditions (if applicable)",
+                "types": "common types or varieties",
+                "category": "general category",
+                "properties": {{
+                    "size": "typical size",
+                    "uses": "common uses",
+                    "origin": "where it's from",
+                    "nutrition": "nutritional info (if food)"
+                }}
+            }}
+            
+            Only include relevant fields. Return valid JSON only.
+            """
+            
+            response = self.groq_client.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=500
+            )
+            
+            content = response.choices[0].message.content.strip()
+            
+            # Extract JSON from response
+            if '```json' in content:
+                content = content.split('```json')[1].split('```')[0]
+            elif '```' in content:
+                content = content.split('```')[1].split('```')[0]
+            
+            info = json.loads(content)
+            return info
+            
+        except Exception as e:
+            logger.error(f"Error extracting structured info: {e}")
+            return {
+                'description': f"A {object_name}",
+                'category': 'unknown',
+                'properties': {}
+            }
+
+
+class TrainingSupervisor:
+    """
+    Agentic AI #3 - Training Supervisor
+    Manages training loops and decides what data to use for training
+    """
+    
+    def __init__(self, knowledge_db: KnowledgeDatabase, secret_trainer: SecretModelTrainer):
+        self.knowledge_db = knowledge_db
+        self.secret_trainer = secret_trainer
+        self.is_running = False
+        self.supervisor_thread = None
+    
+    def start_supervision(self, interval: int = 1800):
+        """Start supervision loop"""
+        if self.supervisor_thread and self.supervisor_thread.is_alive():
+            logger.warning("Supervisor already running")
+            return
+        
+        self.is_running = True
+        self.supervisor_thread = threading.Thread(
+            target=self._supervision_loop,
+            args=(interval,),
+            daemon=True
+        )
+        self.supervisor_thread.start()
+        logger.info(f"✅ Training supervisor started (interval: {interval}s)")
+    
+    def stop_supervision(self):
+        """Stop supervision"""
+        self.is_running = False
+        if self.supervisor_thread:
+            self.supervisor_thread.join(timeout=5)
+        logger.info("Training supervisor stopped")
+    
+    def _supervision_loop(self, interval: int):
+        """Main supervision loop"""
+        while self.is_running:
+            try:
+                # Evaluate training data quality
+                self._evaluate_training_data()
+                
+                # Check if model needs retraining
+                self._check_model_performance()
+                
+                # Clean up old/bad data
+                self._cleanup_data()
+                
+                # Generate synthetic training data from knowledge base
+                self._generate_synthetic_data()
+                
+            except Exception as e:
+                logger.error(f"Supervision loop error: {e}")
+            
+            time.sleep(interval)
+    
+    def _evaluate_training_data(self):
+        """Evaluate and score training data quality"""
+        try:
+            training_data = self.knowledge_db.get_training_data(unused_only=True, limit=50)
+            logger.info(f"Evaluated {len(training_data)} training examples")
+        except Exception as e:
+            logger.error(f"Error evaluating training data: {e}")
+    
+    def _check_model_performance(self):
+        """Check if model performance is degrading"""
+        logger.info("Checking model performance...")
+    
+    def _cleanup_data(self):
+        """Remove low-quality or duplicate data"""
+        logger.info("Cleaning up training data...")
+    
+    def _generate_synthetic_data(self):
+        """Generate synthetic training data from knowledge base"""
+        try:
+            # Get recent objects
+            objects = self.knowledge_db.search_objects(limit=10)
+            
+            for obj in objects:
+                # Create Q&A pairs about the object
+                questions = [
+                    f"What is a {obj['name']}?",
+                    f"Describe {obj['name']}",
+                    f"What are the characteristics of {obj['name']}?"
+                ]
+                
+                for question in questions:
+                    answer = obj.get('description', f"A {obj['name']}")
+                    
+                    # Add to training data
+                    self.knowledge_db.add_training_data(
+                        input_text=question,
+                        output_text=answer,
+                        context=json.dumps(obj),
+                        quality_score=0.6
+                    )
+            
+            logger.info(f"Generated synthetic training data for {len(objects)} objects")
+            
+        except Exception as e:
+            logger.error(f"Error generating synthetic data: {e}")
+
+
+class AgenticSystem:
+    """Main agentic system controller"""
+    
+    def __init__(self, knowledge_db: KnowledgeDatabase, tavily_api_key: str, groq_api_key: str):
+        self.knowledge_db = knowledge_db
+        
+        # Initialize agents
+        self.secret_trainer = SecretModelTrainer(knowledge_db)
+        self.info_gatherer = InfoGatheringAgent(knowledge_db, tavily_api_key, groq_api_key)
+        self.supervisor = TrainingSupervisor(knowledge_db, self.secret_trainer)
+    
+    def start_all_agents(self):
+        """Start all agentic AI systems"""
+        logger.info("🤖 Starting all agentic AI systems...")
+        
+        self.info_gatherer.start_worker()
+        self.secret_trainer.start_training_loop(interval=3600)  # Train every hour
+        self.supervisor.start_supervision(interval=1800)  # Supervise every 30 min
+        
+        logger.info("✅ All agentic AI systems started")
+    
+    def stop_all_agents(self):
+        """Stop all agentic AI systems"""
+        logger.info("Stopping all agentic AI systems...")
+        
+        self.info_gatherer.stop_worker()
+        self.secret_trainer.stop_training_loop()
+        self.supervisor.stop_supervision()
+        
+        logger.info("All agentic AI systems stopped")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get status of all agents"""
+        return {
+            'info_gatherer': {
+                'running': self.info_gatherer.is_running,
+                'queue_size': len(self.info_gatherer.gathering_queue)
+            },
+            'secret_trainer': {
+                'running': self.secret_trainer.training_enabled,
+                'is_training': self.secret_trainer.is_training,
+                'model_available': self.secret_trainer.model is not None
+            },
+            'supervisor': {
+                'running': self.supervisor.is_running
+            }
+        }
+
+
+# ==================== MAIN AI ASSISTANT ====================
 
 class AIAssistant:
     def __init__(self):
@@ -65,24 +1201,15 @@ class AIAssistant:
         # Camera variables
         self.camera = None
         self.vision_mode = False
-        self.current_frame = None  # Store current frame for analysis
+        self.current_frame = None
         self.frame_lock = threading.Lock()
         self.chat_temperature = float(os.getenv('DEFAULT_TEMPERATURE', '0.7'))
         
-        # Chat history (will be managed by frontend localStorage)
+        # System prompt
         self.system_prompt = """You are Moi, an advanced AI assistant with vision, memory, and learning capabilities. 
         You can see objects, describe them, remember information, and have conversations. 
         Be helpful, friendly, and informative in your responses.
         Format your responses clearly without any special tokens or unnecessary formatting characters."""
-    
-    # TTS now handled by Web Speech API in frontend
-    # def setup_tts(self):
-    #     """Configure text-to-speech settings"""
-    #     voices = self.tts_engine.getProperty('voices')
-    #     if voices:
-    #         self.tts_engine.setProperty('voice', voices[0].id)
-    #     self.tts_engine.setProperty('rate', 150)
-    #     self.tts_engine.setProperty('volume', 0.8)
     
     def setup_vision_models(self):
         """Initialize vision and image processing models"""
@@ -90,59 +1217,38 @@ class AIAssistant:
         self.huggingface_available = False
         self.nvidia_available = False
         
-        # Initialize Hugging Face BLIP model with better error handling
+        # Initialize Hugging Face BLIP model
         try:
             print("Loading Hugging Face BLIP model...")
-            
-            # Set cache directory for models
             cache_dir = os.path.join(os.getcwd(), "models_cache")
             os.makedirs(cache_dir, exist_ok=True)
             
-            # Get Hugging Face token if available
             hf_token = os.getenv('HUGGINGFACE_TOKEN')
+            model_name = "Salesforce/blip-image-captioning-base"
             
-            # Try different BLIP model variants for better compatibility
-            model_variants = [
-                "Salesforce/blip-image-captioning-base",
-                "Salesforce/blip-image-captioning-large"
-            ]
+            self.blip_processor = BlipProcessor.from_pretrained(
+                model_name,
+                cache_dir=cache_dir,
+                use_auth_token=hf_token if hf_token else None,
+                trust_remote_code=False
+            )
             
-            for model_name in model_variants:
-                try:
-                    print(f"   Trying {model_name}...")
-                    
-                    # Load processor and model
-                    # Use `use_auth_token` for wider compatibility across transformer versions
-                    self.blip_processor = BlipProcessor.from_pretrained(
-                        model_name,
-                        cache_dir=cache_dir,
-                        use_auth_token=hf_token if hf_token else None,
-                        trust_remote_code=False
-                    )
-                    
-                    self.blip_model = BlipForConditionalGeneration.from_pretrained(
-                        model_name,
-                        cache_dir=cache_dir,
-                        torch_dtype=torch.float16 if self.device.type == 'cuda' else torch.float32,
-                        use_auth_token=hf_token if hf_token else None,
-                        device_map='auto',
-                        low_cpu_mem_usage=True,
-                        trust_remote_code=False
-                    )
-                    
-                    # Move to device and set to evaluation mode
-                    self.blip_model.to(self.device)
-                    self.blip_model.eval()
-                    
-                    self.huggingface_available = True
-                    print(f"✅ Hugging Face BLIP model loaded: {model_name}")
-                    print(f"   Device: {self.device}")
-                    break
-                    
-                except Exception as e:
-                    print(f"   Failed to load {model_name}: {e}")
-                    continue
-                    
+            self.blip_model = BlipForConditionalGeneration.from_pretrained(
+                model_name,
+                cache_dir=cache_dir,
+                torch_dtype=torch.float16 if self.device.type == 'cuda' else torch.float32,
+                use_auth_token=hf_token if hf_token else None,
+                device_map='auto',
+                low_cpu_mem_usage=True,
+                trust_remote_code=False
+            )
+            
+            self.blip_model.to(self.device)
+            self.blip_model.eval()
+            
+            self.huggingface_available = True
+            print(f"✅ Hugging Face BLIP model loaded on {self.device}")
+            
         except Exception as e:
             print(f"❌ Error loading Hugging Face BLIP model: {e}")
             self.blip_processor = None
@@ -155,49 +1261,26 @@ class AIAssistant:
                 self.nvidia_available = True
                 print("✅ NVIDIA Vision API key found")
             else:
-                print("⚠️  NVIDIA_API_KEY not found in environment variables")
+                print("⚠️  NVIDIA_API_KEY not found")
         except Exception as e:
             print(f"❌ Error setting up NVIDIA Vision API: {e}")
         
-        # Check if any vision model is available
         if not self.huggingface_available and not self.nvidia_available:
-            print("❌ No vision models available! Please check your API keys and model installations.")
+            print("❌ No vision models available!")
         else:
-            print(f"✅ Vision system ready - HuggingFace: {self.huggingface_available}, NVIDIA: {self.nvidia_available}")
+            print(f"✅ Vision system ready - HF: {self.huggingface_available}, NVIDIA: {self.nvidia_available}")
     
     def setup_object_detection(self):
         """Initialize object detection model"""
         try:
-            # Try to load YOLOv5 with better error handling
             print("Loading object detection model...")
             self.object_detector = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, force_reload=False, verbose=False)
             self.object_detector.to(self.device)
-            self.object_detector.eval()  # Set to evaluation mode
+            self.object_detector.eval()
             print("✅ Object detection model loaded successfully")
         except Exception as e:
             print(f"⚠️  Error loading object detection model: {e}")
-            print("   Vision mode will work with image captioning only (no object detection)")
             self.object_detector = None
-    
-    # Audio processing now handled by Web Speech API in frontend
-    # def speech_to_text(self, audio_data):
-    #     """Convert speech to text"""
-    #     try:
-    #         with sr.Microphone() as source:
-    #             self.recognizer.adjust_for_ambient_noise(source)
-    #             audio = self.recognizer.listen(source, timeout=5)
-    #             text = self.recognizer.recognize_google(audio)
-    #             return text
-    #     except Exception as e:
-    #         return f"Speech recognition error: {e}"
-    
-    # def text_to_speech(self, text):
-    #     """Convert text to speech"""
-    #     try:
-    #         self.tts_engine.say(text)
-    #         self.tts_engine.runAndWait()
-    #     except Exception as e:
-    #         print(f"TTS error: {e}")
     
     def web_search(self, query):
         """Perform web search using Tavily"""
@@ -215,26 +1298,21 @@ class AIAssistant:
     def process_image_with_blip(self, image):
         """Process image with BLIP for captioning"""
         try:
-            # Check if BLIP model is available
             if not self.huggingface_available or self.blip_processor is None or self.blip_model is None:
                 return "Hugging Face BLIP model not available"
             
-            # Ensure image is in PIL format
             if isinstance(image, np.ndarray):
                 image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             elif not isinstance(image, Image.Image):
                 image = Image.open(image)
             
-            # Resize image if too large (BLIP has memory constraints)
             max_size = 512
             if image.width > max_size or image.height > max_size:
                 image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-            # Process with BLIP
             inputs = self.blip_processor(image, return_tensors="pt").to(self.device)
             
-            # Generate caption with better parameters
-            with torch.no_grad():  # Save memory
+            with torch.no_grad():
                 out = self.blip_model.generate(
                     **inputs, 
                     max_length=50,
@@ -244,17 +1322,8 @@ class AIAssistant:
                 )
             
             caption = self.blip_processor.decode(out[0], skip_special_tokens=True)
+            return caption.strip() if caption else "Unable to generate caption"
             
-            # Clean up the caption
-            caption = caption.strip()
-            if not caption:
-                caption = "Unable to generate caption for this image"
-            
-            return caption
-            
-        except torch.cuda.OutOfMemoryError:
-            print("CUDA out of memory for BLIP processing")
-            return "Error: Not enough GPU memory for image processing"
         except Exception as e:
             print(f"BLIP processing error: {e}")
             return f"Error processing image with BLIP: {str(e)}"
@@ -262,9 +1331,7 @@ class AIAssistant:
     def process_image_with_nvidia(self, image):
         """Process image with NVIDIA Vision API"""
         try:
-            # Convert image to base64
             if isinstance(image, np.ndarray):
-                # Convert BGR to RGB
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(image_rgb)
             elif isinstance(image, Image.Image):
@@ -272,17 +1339,14 @@ class AIAssistant:
             else:
                 pil_image = Image.open(image)
             
-            # Resize image if too large (NVIDIA API has size limits)
             max_size = 1024
             if pil_image.width > max_size or pil_image.height > max_size:
                 pil_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-            # Convert to base64
             buffer = io.BytesIO()
             pil_image.save(buffer, format='JPEG', quality=85)
             image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
             
-            # Prepare API request
             invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {self.nvidia_api_key}",
@@ -314,7 +1378,6 @@ class AIAssistant:
                 "top_p": 0.9
             }
             
-            # Make API request
             response = requests.post(invoke_url, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
             
@@ -336,7 +1399,6 @@ class AIAssistant:
             'nvidia_available': self.nvidia_available
         }
         
-        # Try NVIDIA first (usually better quality)
         if self.nvidia_available:
             try:
                 print("Processing image with NVIDIA Vision API...")
@@ -348,7 +1410,6 @@ class AIAssistant:
             except Exception as e:
                 print(f"❌ NVIDIA Vision API failed: {e}")
         
-        # Fallback to Hugging Face BLIP
         if self.huggingface_available:
             try:
                 print("Processing image with Hugging Face BLIP...")
@@ -360,7 +1421,6 @@ class AIAssistant:
             except Exception as e:
                 print(f"❌ Hugging Face BLIP failed: {e}")
         
-        # No models available
         results['caption'] = "No vision models available. Please check your API keys and model installations."
         results['model_used'] = 'none'
         return results
@@ -371,23 +1431,22 @@ class AIAssistant:
             if self.object_detector is None:
                 return []
             
-            # Convert image for YOLO
             if isinstance(image, np.ndarray):
                 results = self.object_detector(image)
             else:
                 results = self.object_detector(np.array(image))
             
-            # Extract detections
             detections = []
             for *box, conf, cls in results.xyxy[0].cpu().numpy():
-                if conf > 0.5:  # Confidence threshold
+                if conf > 0.5:
                     x1, y1, x2, y2 = map(int, box)
                     class_name = self.object_detector.names[int(cls)]
-                    # Compute normalized bounding box (x, y, w, h) relative to image dimensions (0-1 range)
+                    
                     if isinstance(image, np.ndarray):
                         h, w = image.shape[:2]
                     else:
                         h, w = np.array(image).shape[:2]
+                    
                     width = x2 - x1
                     height = y2 - y1
                     bbox = [x1 / w, y1 / h, width / w, height / h]
@@ -415,7 +1474,6 @@ class AIAssistant:
             for i, detection in enumerate(detections):
                 class_name = detection['class']
                 
-                # Generate random color for each object
                 import random
                 color = (
                     random.randint(50, 255),
@@ -423,7 +1481,6 @@ class AIAssistant:
                     random.randint(50, 255)
                 )
                 
-                # Use GPT OSS 120B to extract specific description for this object
                 specific_description = self.extract_object_description_with_gpt(scene_description, class_name, image)
                 
                 # Store/update object in knowledge database
@@ -461,7 +1518,6 @@ class AIAssistant:
     def extract_object_description_with_gpt(self, scene_description, object_class, image):
         """Use GPT OSS 120B to extract specific description for an object"""
         try:
-            # Create a focused prompt for object description
             prompt = f"""
             Based on this scene description: "{scene_description}"
             
@@ -474,7 +1530,6 @@ class AIAssistant:
             Be specific and detailed. Only describe the {object_class}, not other objects.
             """
             
-            # Use GPT to get a focused description
             messages = [{"role": "user", "content": prompt}]
             description = self.chat_with_groq(messages, model="openai/gpt-oss-120b")
             
@@ -484,61 +1539,17 @@ class AIAssistant:
             print(f"GPT description extraction error: {e}")
             return f"A {object_class} is visible in the scene."
     
-    def extract_object_description(self, scene_description, object_class):
-        """Fallback method for object description extraction"""
-        try:
-            # Simple keyword-based extraction as fallback
-            sentences = scene_description.split('.')
-            
-            for sentence in sentences:
-                if object_class.lower() in sentence.lower():
-                    return sentence.strip()
-            
-            return f"A {object_class} is visible in the scene."
-        except Exception as e:
-            print(f"Description extraction error: {e}")
-            return f"A {object_class} is visible in the scene."
-    
-    def draw_detections(self, image, detections):
-        """Draw bounding boxes on image with colors"""
-        try:
-            for detection in detections:
-                x1, y1, x2, y2 = detection['box']
-                class_name = detection['class']
-                confidence = detection['confidence']
-                color = detection.get('color', (0, 255, 0))  # Default green
-                
-                # Draw bounding box with specific color
-                cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-                
-                # Draw label with same color
-                label = f"{class_name}: {confidence:.2f}"
-                cv2.putText(image, label, (x1, y1-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            return image
-        except Exception as e:
-            print(f"Drawing error: {e}")
-            return image
-    
     def clean_response_text(self, text):
         """Clean AI response text from unwanted formatting characters"""
         if not text:
             return ""
         
-        # Remove common special tokens
-        text = re.sub(r'<\|.*?\|>', '', text)  # Remove tokens like <|end|>
-        text = re.sub(r'\[\[.*?\]\]', '', text)  # Remove [[tokens]]
-        text = re.sub(r'<<.*?>>', '', text)  # Remove <<tokens>>
-        
-        # Clean up excessive whitespace
-        text = re.sub(r'\n{3,}', '\n\n', text)  # Replace 3+ newlines with 2
-        text = re.sub(r' {2,}', ' ', text)  # Replace multiple spaces with single
-        
-        # Remove any remaining special characters at start/end
+        text = re.sub(r'<\|.*?\|>', '', text)
+        text = re.sub(r'\[\[.*?\]\]', '', text)
+        text = re.sub(r'<<.*?>>', '', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' {2,}', ' ', text)
         text = text.strip()
-        
-        # Unescape HTML entities if any
         text = html.unescape(text)
         
         return text
@@ -546,16 +1557,13 @@ class AIAssistant:
     def chat_with_groq(self, messages, model="openai/gpt-oss-120b", think_mode=False, reasoning_level="medium", custom_behavior="", temperature=None, stream=False):
         """Chat with Groq API with optional think mode and custom behavior"""
         try:
-            # Add system prompt
             system_prompt = self.system_prompt
             formatted_messages = [{"role": "system", "content": system_prompt}]
             formatted_messages.extend(messages)
             
-            # Add custom behavior if provided
             if custom_behavior:
                 formatted_messages[0]["content"] += f"\n\nCustom Behavior Instructions: {custom_behavior}"
             
-            # Modify system prompt for think mode
             if think_mode:
                 think_prompts = {
                     "high": "Think step by step. Show your reasoning process in detail. Break down complex problems into smaller parts. Explain your thought process for each step.",
@@ -567,7 +1575,7 @@ class AIAssistant:
             response = self.groq_client.chat.completions.create(
                 model=model,
                 messages=formatted_messages,
-                max_tokens=4096,  # Increased token limit
+                max_tokens=4096,
                 temperature=temperature if temperature is not None else self.chat_temperature,
                 stream=stream
             )
@@ -576,7 +1584,6 @@ class AIAssistant:
                 return response
             else:
                 content = response.choices[0].message.content
-                # Clean the response text
                 return self.clean_response_text(content)
         except Exception as e:
             return f"Error: {e}"
@@ -585,7 +1592,6 @@ class AIAssistant:
         """Process uploaded files"""
         try:
             if file_type.startswith('image/'):
-                # Process image file
                 image = Image.open(io.BytesIO(file_content))
                 vision_results = self.process_image_vision(image)
                 detections = self.detect_objects(image)
@@ -600,11 +1606,10 @@ class AIAssistant:
                 }
             
             elif file_type == 'text/plain':
-                # Process text file
                 text_content = file_content.decode('utf-8')
                 return {
                     'type': 'text',
-                    'content': text_content[:1000]  # Limit text length
+                    'content': text_content[:1000]
                 }
             
             else:
@@ -613,8 +1618,12 @@ class AIAssistant:
         except Exception as e:
             return {'type': 'error', 'message': str(e)}
 
+
 # Initialize AI Assistant
 ai_assistant = AIAssistant()
+
+
+# ==================== FLASK ROUTES ====================
 
 @app.route('/')
 def index():
@@ -631,14 +1640,11 @@ def chat():
         reasoning_level = data.get('reasoning_level', 'medium')
         custom_behavior = data.get('custom_behavior', '')
         temperature = float(data.get('temperature', ai_assistant.chat_temperature))
-        files = data.get('files', [])
         continue_generation = data.get('continue_generation', False)
         
-        # Handle continuation
         if continue_generation:
             user_message = "Please continue from where you left off."
         
-        # Check for web search request only if enabled
         if web_search_enabled and not continue_generation and any(keyword in user_message.lower() for keyword in ['search', 'look up', 'find information', 'what is', 'how to']):
             search_results = ai_assistant.web_search(user_message)
             if search_results:
@@ -646,19 +1652,16 @@ def chat():
                                    for result in search_results[:3]])
                 user_message += f"\n\nSearch results:\n{context}"
         
-        # Prepare messages for Groq
         messages = []
-        for msg in chat_history[-10:]:  # Keep last 10 messages for context
+        for msg in chat_history[-10:]:
             messages.append({"role": msg['role'], "content": msg['content']})
         
         if not continue_generation:
             messages.append({"role": "user", "content": user_message})
         
-        # Get response from Groq with think mode support
         response = ai_assistant.chat_with_groq(messages, think_mode=think_mode, reasoning_level=reasoning_level, custom_behavior=custom_behavior, temperature=temperature)
         
-        # Check if response was cut off (ends abruptly)
-        needs_continuation = len(response) > 3800  # Near token limit
+        needs_continuation = len(response) > 3800
         
         return jsonify({
             'response': response,
@@ -670,29 +1673,6 @@ def chat():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-# Audio endpoints removed - now handled by Web Speech API in frontend
-# @app.route('/speech-to-text', methods=['POST'])
-# def speech_to_text():
-#     try:
-#         # This would be implemented with real-time audio capture
-#         # For now, return a placeholder
-#         return jsonify({'text': 'Speech recognition not implemented in demo'})
-#     except Exception as e:
-#         return jsonify({'error': str(e)}), 500
-
-# @app.route('/text-to-speech', methods=['POST'])
-# def text_to_speech():
-#     try:
-#         data = request.json
-#         text = data.get('text', '')
-        
-#         # Run TTS in background thread to avoid blocking
-#         threading.Thread(target=ai_assistant.text_to_speech, args=(text,)).start()
-        
-#         return jsonify({'status': 'success'})
-#     except Exception as e:
-#         return jsonify({'error': str(e)}), 500
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -715,22 +1695,18 @@ def start_vision():
     try:
         ai_assistant.vision_mode = True
         
-        # Try to initialize camera with better error handling
         if ai_assistant.camera is None:
             ai_assistant.camera = cv2.VideoCapture(0)
             
-        # Check if camera is working
         if not ai_assistant.camera.isOpened():
             ai_assistant.camera = cv2.VideoCapture(0)
             
-        # Prefer lower resolution to reduce latency
         try:
             ai_assistant.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             ai_assistant.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         except Exception:
             pass
         
-        # Test camera
         ret, frame = ai_assistant.camera.read()
         if not ret:
             return jsonify({'error': 'Camera not accessible. Please check if camera is connected and not being used by another application.'}), 400
@@ -759,14 +1735,9 @@ def video_feed():
                     print("Failed to read frame from camera")
                     break
                 
-                # Store current frame for analysis
                 with ai_assistant.frame_lock:
                     ai_assistant.current_frame = frame.copy()
                 
-                # Just show the raw frame without processing (for performance)
-                # Processing will happen only when analyze button is clicked
-                
-                # Convert frame to bytes
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 if not ret:
                     print("Failed to encode frame")
@@ -785,7 +1756,6 @@ def video_feed():
 @app.route('/analyze-frame', methods=['POST'])
 def analyze_frame():
     try:
-        # Use stored current frame instead of reading new one (thread-safe)
         with ai_assistant.frame_lock:
             if ai_assistant.current_frame is None:
                 if not ai_assistant.camera or not ai_assistant.camera.isOpened():
@@ -797,15 +1767,11 @@ def analyze_frame():
             frame = ai_assistant.current_frame
             ai_assistant.current_frame = None
         
-        # Process image with available vision models
         vision_results = ai_assistant.process_image_vision(frame)
         
-        # Get enhanced object detections with descriptions and colors
         detections = []
         if ai_assistant.object_detector is not None:
             detections = ai_assistant.detect_objects_with_descriptions(frame, vision_results['caption'])
-        
-        # current_frame cleared in locked section above
         
         return jsonify({
             'caption': vision_results['caption'],
@@ -851,10 +1817,8 @@ def ask_about_object():
         if not object_class or not user_question:
             return jsonify({'error': 'Object class and question are required'}), 400
         
-        # Parse the user question to understand what they're asking
         question_lower = user_question.lower()
         
-        # Determine the type of query
         search_query = ""
         if 'price' in question_lower or 'cost' in question_lower:
             search_query = f"{object_class} price cost {location} current 2024 market rate"
@@ -869,19 +1833,15 @@ def ask_about_object():
         elif 'recipe' in question_lower or 'cook' in question_lower or 'prepare' in question_lower:
             search_query = f"{object_class} recipes cooking methods preparation dishes {location} cuisine"
         else:
-            # General query
             search_query = f"{object_class} {user_question} {location}"
         
-        # Perform web search
         search_results = ai_assistant.web_search(search_query)
         
-        # Prepare context from search results
         search_context = "\n".join([
             f"- {result.get('title', '')}: {result.get('content', '')[:300]}"
             for result in search_results[:3]
         ])
         
-        # Generate comprehensive answer using GPT
         answer_prompt = f"""
         Object: {object_class}
         Description from image: {object_description}
@@ -914,58 +1874,6 @@ def ask_about_object():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def terminal_interface():
-    """Terminal interface for the AI assistant"""
-    print("🤖 Moi AI Assistant - Terminal Interface")
-    print("Model: Groq OpenAI GPT-OSS 120B")
-    print("Vision: Salesforce/blip-image-captioning-base")
-    print("Audio: Web Speech API (browser only)")
-    print("Commands: 'exit' to quit, 'search: <query>' for web search")
-    print("-" * 60)
-    
-    chat_history = []
-    
-    while True:
-        try:
-            user_input = input("\n👤 You: ").strip()
-            
-            if user_input.lower() == 'exit':
-                print("👋 Goodbye!")
-                break
-            
-            if user_input.startswith('search:'):
-                query = user_input[7:].strip()
-                print("🔍 Searching...")
-                search_results = ai_assistant.web_search(query)
-                
-                if search_results:
-                    print("\n📊 Search Results:")
-                    for i, result in enumerate(search_results[:3], 1):
-                        print(f"{i}. {result.get('title', 'No title')}")
-                        print(f"   {result.get('content', 'No content')[:200]}...")
-                        print()
-                continue
-            
-            # Add to chat history
-            chat_history.append({"role": "user", "content": user_input})
-            
-            print("🔄 Processing with GPT-OSS 120B...")
-            
-            # Get response
-            messages = chat_history[-10:]  # Keep last 10 messages
-            response = ai_assistant.chat_with_groq(messages, model="openai/gpt-oss-120b")
-            
-            print(f"\n🤖 Moi: {response}")
-            
-            # Add response to history
-            chat_history.append({"role": "assistant", "content": response})
-            
-        except KeyboardInterrupt:
-            print("\n👋 Goodbye!")
-            break
-        except Exception as e:
-            print(f"❌ Error: {e}")
-
 @app.route('/improve-prompt', methods=['POST'])
 def improve_prompt():
     """Improve user prompt using AI"""
@@ -976,7 +1884,6 @@ def improve_prompt():
         if not prompt:
             return jsonify({'error': 'No prompt provided'}), 400
         
-        # Use Groq to improve the prompt
         response = ai_assistant.groq_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": "You are an expert at improving prompts to get better AI responses. Your task is to enhance the user's prompt to be more specific, detailed, and structured. Do not add unnecessary complexity, but make it clearer and more likely to get a high-quality response. Return ONLY the improved prompt without explanations or additional text."},
@@ -998,34 +1905,28 @@ def search_object():
     try:
         data = request.json
         object_name = data.get('object_name', '')
-        query_context = data.get('query_context', '')  # Additional context from user query
-        location = data.get('location', 'India')  # Default location
+        query_context = data.get('query_context', '')
+        location = data.get('location', 'India')
         
         if not object_name:
             return jsonify({'error': 'No object name provided'}), 400
         
-        # Build context-aware search query
         if query_context:
-            # User has specific questions about the object
             query = f"{object_name} {query_context} in {location}"
         else:
-            # Default comprehensive search
             query = f"{object_name} current price {location} where to buy specifications features reviews 2024"
         
-        # Perform web search
         search_results = ai_assistant.web_search(query)
         
-        # Format and enhance results
         formatted_results = []
         for result in search_results[:5]:
             formatted_results.append({
                 'title': result.get('title', ''),
                 'content': result.get('content', ''),
                 'url': result.get('url', ''),
-                'score': result.get('score', 0)  # Relevance score if available
+                'score': result.get('score', 0)
             })
         
-        # Use GPT to summarize findings if we have results
         summary = ""
         if formatted_results:
             summary_prompt = f"""Based on these search results about {object_name}:
@@ -1066,7 +1967,6 @@ def generate_image():
         if not prompt:
             return jsonify({'error': 'No prompt provided'}), 400
         
-        # Generate image
         image_base64 = ai_assistant.image_generator.generate_and_encode(prompt, backend, size)
         
         if image_base64:
@@ -1114,7 +2014,6 @@ def add_or_update_object():
         if not object_name:
             return jsonify({'error': 'Object name is required'}), 400
         
-        # Extract fields
         description = data.get('description', '')
         color = data.get('color', '')
         climate = data.get('climate', '')
@@ -1122,7 +2021,6 @@ def add_or_update_object():
         category = data.get('category', '')
         user_notes = data.get('user_notes', '')
         
-        # Add or update object
         object_id = ai_assistant.knowledge_db.add_object(
             name=object_name,
             description=description,
@@ -1133,7 +2031,6 @@ def add_or_update_object():
             user_notes=user_notes
         )
         
-        # Add custom properties if provided
         properties = data.get('properties', {})
         for key, value in properties.items():
             ai_assistant.knowledge_db.add_property(object_name, key, value, source='user')
@@ -1233,7 +2130,6 @@ def chat_with_memory():
         user_message = data.get('message', '')
         chat_history = data.get('history', [])
         
-        # Extract potential object names from message
         words = user_message.lower().split()
         context_info = []
         
@@ -1242,22 +2138,18 @@ def chat_with_memory():
             if obj_info:
                 context_info.append(f"I know about {word}: {obj_info.get('description', '')}")
         
-        # Add context to message
         if context_info:
             enhanced_message = f"{user_message}\n\n[Context from my memory: {' '.join(context_info)}]"
         else:
             enhanced_message = user_message
         
-        # Prepare messages
         messages = []
         for msg in chat_history[-10:]:
             messages.append({"role": msg['role'], "content": msg['content']})
         messages.append({"role": "user", "content": enhanced_message})
         
-        # Get response
         response = ai_assistant.chat_with_groq(messages)
         
-        # Store conversation as training data
         ai_assistant.knowledge_db.add_training_data(
             input_text=user_message,
             output_text=response,
@@ -1274,6 +2166,57 @@ def chat_with_memory():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+def terminal_interface():
+    """Terminal interface for the AI assistant"""
+    print("🤖 Moi AI Assistant - Terminal Interface")
+    print("Model: Groq OpenAI GPT-OSS 120B")
+    print("Vision: Salesforce/blip-image-captioning-base")
+    print("Audio: Web Speech API (browser only)")
+    print("Commands: 'exit' to quit, 'search: <query>' for web search")
+    print("-" * 60)
+    
+    chat_history = []
+    
+    while True:
+        try:
+            user_input = input("\n👤 You: ").strip()
+            
+            if user_input.lower() == 'exit':
+                print("👋 Goodbye!")
+                break
+            
+            if user_input.startswith('search:'):
+                query = user_input[7:].strip()
+                print("🔍 Searching...")
+                search_results = ai_assistant.web_search(query)
+                
+                if search_results:
+                    print("\n📊 Search Results:")
+                    for i, result in enumerate(search_results[:3], 1):
+                        print(f"{i}. {result.get('title', 'No title')}")
+                        print(f"   {result.get('content', 'No content')[:200]}...")
+                        print()
+                continue
+            
+            chat_history.append({"role": "user", "content": user_input})
+            
+            print("🔄 Processing with GPT-OSS 120B...")
+            
+            messages = chat_history[-10:]
+            response = ai_assistant.chat_with_groq(messages, model="openai/gpt-oss-120b")
+            
+            print(f"\n🤖 Moi: {response}")
+            
+            chat_history.append({"role": "assistant", "content": response})
+            
+        except KeyboardInterrupt:
+            print("\n👋 Goodbye!")
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
+
+
 if __name__ == '__main__':
     import sys
     
@@ -1286,4 +2229,3 @@ if __name__ == '__main__':
         print("🌐 Web interface: http://localhost:5000")
         print("💻 Terminal interface: python app.py terminal")
         app.run(debug=True, host='0.0.0.0', port=5000)
-
