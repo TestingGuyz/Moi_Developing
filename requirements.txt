@@ -1,0 +1,12 @@
+flask==3.0.3
+flask-cors==4.0.1
+groq==0.11.0
+tavily-python==0.3.5
+python-dotenv==1.0.1
+opencv-python==4.10.0.84
+pillow==10.4.0
+torch>=2.2.0
+transformers==4.44.2
+accelerate==0.34.2
+numpy==1.26.4
+requests==2.32.3

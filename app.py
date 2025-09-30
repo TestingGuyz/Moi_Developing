@@ -44,6 +44,20 @@ class AIAssistant:
         self.frame_lock = threading.Lock()
         self.chat_temperature = float(os.getenv('DEFAULT_TEMPERATURE', '0.7'))
         
+        # Knowledge DB (JSON-backed)
+        self.knowledge_db_path = os.path.join(os.getcwd(), "data", "knowledge_db.json")
+        os.makedirs(os.path.dirname(self.knowledge_db_path), exist_ok=True)
+        self.knowledge_lock = threading.Lock()
+        self.knowledge = self.load_knowledge_db()
+
+        # Background agents
+        self.agents_enabled = os.getenv('BACKGROUND_AGENTS', 'true').lower() in ['1', 'true', 'yes']
+        self.agent_interval_seconds = int(os.getenv('AGENT_INTERVAL_SECONDS', '120'))
+        self.shutdown_event = threading.Event()
+        self.secret_model_state_path = os.path.join(os.getcwd(), "data", "secret_model_state.json")
+        if self.agents_enabled:
+            self.start_background_agents()
+        
         # Chat history (will be managed by frontend localStorage)
         self.system_prompt = """You are Moi, an advanced AI assistant with vision, memory, and learning capabilities. 
         You can see objects, describe them, remember information, and have conversations. 
@@ -568,6 +582,247 @@ class AIAssistant:
         except Exception as e:
             return {'type': 'error', 'message': str(e)}
 
+    # ==========================
+    # Knowledge DB functionality
+    # ==========================
+    def normalize_object_name(self, name):
+        try:
+            return re.sub(r'\s+', ' ', str(name).strip().lower())
+        except Exception:
+            return str(name).strip().lower() if name else ''
+
+    def load_knowledge_db(self):
+        try:
+            if os.path.exists(self.knowledge_db_path):
+                with open(self.knowledge_db_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # Ensure keys are normalized
+                    normalized = {}
+                    for key, value in data.items():
+                        normalized[self.normalize_object_name(key)] = value
+                    return normalized
+            return {}
+        except Exception as e:
+            print(f"Knowledge DB load error: {e}")
+            return {}
+
+    def save_knowledge_db(self):
+        try:
+            with self.knowledge_lock:
+                with open(self.knowledge_db_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.knowledge, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Knowledge DB save error: {e}")
+
+    def get_object_knowledge(self, name):
+        try:
+            key = self.normalize_object_name(name)
+            return self.knowledge.get(key)
+        except Exception:
+            return None
+
+    def upsert_object_knowledge(self, name, data):
+        try:
+            key = self.normalize_object_name(name)
+            if not key:
+                raise ValueError('Invalid object name')
+            with self.knowledge_lock:
+                existing = self.knowledge.get(key, {})
+                # Merge shallowly
+                merged = {**existing, **(data or {})}
+                # Initialize structured fields
+                if 'user_notes' not in merged or not isinstance(merged.get('user_notes'), list):
+                    merged['user_notes'] = existing.get('user_notes', []) if isinstance(existing.get('user_notes'), list) else []
+                # Maintain canonical name
+                merged['name'] = merged.get('name') or name
+                merged['updated_at'] = datetime.utcnow().isoformat()
+                # Save
+                self.knowledge[key] = merged
+                self.save_knowledge_db()
+                return merged
+        except Exception as e:
+            raise e
+
+    def add_note_to_object(self, name, note):
+        try:
+            key = self.normalize_object_name(name)
+            if not key:
+                raise ValueError('Invalid object name')
+            with self.knowledge_lock:
+                entry = self.knowledge.get(key, {'name': name, 'user_notes': []})
+                if 'user_notes' not in entry or not isinstance(entry['user_notes'], list):
+                    entry['user_notes'] = []
+                entry['user_notes'].append({
+                    'note': str(note),
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                entry['updated_at'] = datetime.utcnow().isoformat()
+                self.knowledge[key] = entry
+                self.save_knowledge_db()
+                return entry
+        except Exception as e:
+            raise e
+
+    def delete_object_knowledge(self, name):
+        try:
+            key = self.normalize_object_name(name)
+            with self.knowledge_lock:
+                existed = key in self.knowledge
+                if existed:
+                    del self.knowledge[key]
+                    self.save_knowledge_db()
+                return existed
+        except Exception as e:
+            raise e
+
+    def search_knowledge(self, query, limit=20):
+        try:
+            q = self.normalize_object_name(query)
+            results = []
+            with self.knowledge_lock:
+                for key, entry in self.knowledge.items():
+                    if q in key:
+                        results.append(entry)
+                        continue
+                    # Search in selected fields
+                    haystack = ' '.join([
+                        str(entry.get('name', '')),
+                        str(entry.get('color', '')),
+                        str(entry.get('types', '')),
+                        str(entry.get('climate', '')),
+                        str(entry.get('category', '')),
+                        str(entry.get('description', ''))
+                    ]).lower()
+                    if q and q in haystack:
+                        results.append(entry)
+                    if len(results) >= limit:
+                        break
+            return results
+        except Exception as e:
+            print(f"Knowledge search error: {e}")
+            return []
+
+    # =============================
+    # Knowledge enrichment pipeline
+    # =============================
+    def auto_enrich_object_knowledge(self, object_name, scene_caption=""):
+        try:
+            object_name_norm = self.normalize_object_name(object_name)
+            if not object_name_norm:
+                return
+            # Avoid duplicate enrich if already known
+            if self.get_object_knowledge(object_name_norm):
+                return
+            # Perform targeted web search
+            query = f"{object_name} facts color types climate nutrients uses description"
+            results = self.web_search(query)
+            context = "\n".join([f"- {r.get('title','')}: {r.get('content','')}" for r in results[:3]])
+            # Ask LLM to produce structured JSON
+            prompt = f"""
+            You are a structured information extractor. Build a concise JSON object for the object named "{object_name}".
+            Include fields if available: name, category, color, colors, types, climate, nutrients, features, description, synonyms.
+            Use arrays for list-like fields. Keep values short and factual. If unknown, omit the field.
+            Scene hint (may help disambiguate): {scene_caption}
+            Evidence:
+            {context}
+
+            Return ONLY valid JSON.
+            """
+            messages = [{"role": "user", "content": prompt}]
+            raw = self.chat_with_groq(messages, model="openai/gpt-oss-120b", temperature=0.2)
+            data = {}
+            try:
+                data = json.loads(raw)
+            except Exception:
+                # Fallback minimal record
+                data = {"name": object_name, "description": self.clean_response_text(raw)[:500]}
+            # Ensure name present
+            if 'name' not in data or not data['name']:
+                data['name'] = object_name
+            self.upsert_object_knowledge(object_name, data)
+        except Exception as e:
+            print(f"Auto enrich error for {object_name}: {e}")
+
+    # =============================
+    # Background Agents (Trainer & Supervisor)
+    # =============================
+    def start_background_agents(self):
+        try:
+            threading.Thread(target=self.agent1_trainer_loop, name='Agent1Trainer', daemon=True).start()
+            threading.Thread(target=self.agent3_supervisor_loop, name='Agent3Supervisor', daemon=True).start()
+            print("✅ Background agents started")
+        except Exception as e:
+            print(f"⚠️  Failed to start background agents: {e}")
+
+    def read_secret_model_state(self):
+        try:
+            if os.path.exists(self.secret_model_state_path):
+                with open(self.secret_model_state_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            return {"last_updated": None, "notes": [], "stats": {"train_iterations": 0}}
+        except Exception as e:
+            print(f"Secret model state read error: {e}")
+            return {"last_updated": None, "notes": [], "stats": {"train_iterations": 0}}
+
+    def write_secret_model_state(self, state):
+        try:
+            with open(self.secret_model_state_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Secret model state write error: {e}")
+
+    def agent1_trainer_loop(self):
+        """Simulate training of hidden generative model using collected knowledge."""
+        while not self.shutdown_event.is_set():
+            try:
+                state = self.read_secret_model_state()
+                # Create a compact summary from knowledge as pseudo-training signal
+                with self.knowledge_lock:
+                    sample_items = list(self.knowledge.values())[:10]
+                summary = "; ".join([
+                    f"{item.get('name','unknown')}: {item.get('category','') or ''} {item.get('colors', item.get('color','')) or ''}"
+                    for item in sample_items
+                ])
+                if summary:
+                    note = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "event": "train_step",
+                        "summary": summary[:500]
+                    }
+                    state.setdefault('notes', []).append(note)
+                    stats = state.setdefault('stats', {"train_iterations": 0})
+                    stats['train_iterations'] = int(stats.get('train_iterations', 0)) + 1
+                    state['last_updated'] = datetime.utcnow().isoformat()
+                    self.write_secret_model_state(state)
+            except Exception as e:
+                print(f"Agent1 trainer error: {e}")
+            finally:
+                time.sleep(self.agent_interval_seconds)
+
+    def agent3_supervisor_loop(self):
+        """Supervisor that decides which objects to enrich next and monitors availability of models."""
+        while not self.shutdown_event.is_set():
+            try:
+                # Check model availability logs
+                print(f"[Supervisor] Models - HF:{self.huggingface_available} NV:{self.nvidia_available} OD:{self.object_detector is not None}")
+                # Identify objects missing fields and queue enrichment
+                with self.knowledge_lock:
+                    items = list(self.knowledge.values())
+                for item in items[:5]:
+                    needs = not item.get('types') or not item.get('description') or not item.get('colors')
+                    if needs:
+                        threading.Thread(target=self.auto_enrich_object_knowledge, args=(item.get('name',''), ''), daemon=True).start()
+                # Also try to enrich recently detected common classes if unknown
+                # (simple heuristic: common COCO classes)
+                common_classes = ["person", "bicycle", "car", "dog", "cat", "orange", "apple", "chair", "bottle"]
+                for cls in common_classes:
+                    if not self.get_object_knowledge(cls):
+                        threading.Thread(target=self.auto_enrich_object_knowledge, args=(cls, ''), daemon=True).start()
+            except Exception as e:
+                print(f"Agent3 supervisor error: {e}")
+            finally:
+                time.sleep(self.agent_interval_seconds)
+
 # Initialize AI Assistant
 ai_assistant = AIAssistant()
 
@@ -759,6 +1014,21 @@ def analyze_frame():
         detections = []
         if ai_assistant.object_detector is not None:
             detections = ai_assistant.detect_objects_with_descriptions(frame, vision_results['caption'])
+        
+        # Attach knowledge entries and trigger enrichment for unknowns
+        enriched_detections = []
+        for det in detections:
+            obj_name = det.get('class', '')
+            knowledge = ai_assistant.get_object_knowledge(obj_name)
+            known = knowledge is not None
+            det_with_knowledge = {**det, 'known': known, 'knowledge': knowledge}
+            enriched_detections.append(det_with_knowledge)
+            
+            # Auto-enrich unknown objects in background
+            if not known and os.getenv('AUTO_ENRICH', 'true').lower() in ['1','true','yes']:
+                threading.Thread(target=ai_assistant.auto_enrich_object_knowledge, args=(obj_name, vision_results['caption']), daemon=True).start()
+        
+        detections = enriched_detections
         
         # current_frame cleared in locked section above
         
@@ -1004,6 +1274,134 @@ def search_object():
             'results': formatted_results
         })
         
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ==========================
+# Knowledge DB API endpoints
+# ==========================
+@app.route('/knowledge', methods=['GET'])
+def list_knowledge():
+    try:
+        q = request.args.get('q', '').strip()
+        if q:
+            items = ai_assistant.search_knowledge(q)
+        else:
+            with ai_assistant.knowledge_lock:
+                items = list(ai_assistant.knowledge.values())
+        return jsonify({'items': items, 'count': len(items)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/search', methods=['GET'])
+def search_knowledge_endpoint():
+    try:
+        q = request.args.get('q', '')
+        items = ai_assistant.search_knowledge(q)
+        return jsonify({'items': items, 'count': len(items)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/<name>', methods=['GET'])
+def get_knowledge(name):
+    try:
+        data = ai_assistant.get_object_knowledge(name)
+        if not data:
+            return jsonify({'error': 'Not found'}), 404
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/<name>', methods=['PUT', 'PATCH'])
+def upsert_knowledge(name):
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        updated = ai_assistant.upsert_object_knowledge(name, payload)
+        return jsonify(updated)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/<name>/notes', methods=['POST'])
+def add_note_knowledge(name):
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        note = payload.get('note', '')
+        if not note:
+            return jsonify({'error': 'Note is required'}), 400
+        entry = ai_assistant.add_note_to_object(name, note)
+        return jsonify(entry)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/knowledge/<name>', methods=['DELETE'])
+def delete_knowledge(name):
+    try:
+        existed = ai_assistant.delete_object_knowledge(name)
+        if not existed:
+            return jsonify({'status': 'not_found'}), 404
+        return jsonify({'status': 'deleted'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ==========================
+# Image generation endpoint
+# ==========================
+@app.route('/generate-image', methods=['POST'])
+def generate_image():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        prompt = data.get('prompt', '').strip()
+        if not prompt:
+            return jsonify({'error': 'Prompt is required'}), 400
+        # Try Stability API first
+        stability_key = os.getenv('STABILITY_API_KEY')
+        if stability_key:
+            try:
+                resp = requests.post(
+                    'https://api.stability.ai/v1/generation/stable-diffusion-v1-6/text-to-image',
+                    headers={
+                        'Authorization': f'Bearer {stability_key}',
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    },
+                    json={
+                        'text_prompts': [{'text': prompt}],
+                        'cfg_scale': 7,
+                        'clip_guidance_preset': 'FAST_BLUE',
+                        'height': 512,
+                        'width': 512,
+                        'samples': 1,
+                        'steps': 30
+                    },
+                    timeout=60
+                )
+                resp.raise_for_status()
+                out = resp.json()
+                if out.get('artifacts'):
+                    b64 = out['artifacts'][0].get('base64')
+                    return jsonify({'image_base64': b64, 'provider': 'stability'})
+            except Exception as e:
+                print(f"Stability API error: {e}")
+        # Fallback to Hugging Face Inference API
+        hf_token = os.getenv('HUGGINGFACE_TOKEN')
+        if hf_token:
+            try:
+                resp = requests.post(
+                    'https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1',
+                    headers={
+                        'Authorization': f'Bearer {hf_token}',
+                        'Accept': 'image/png'
+                    },
+                    data=prompt.encode('utf-8'),
+                    timeout=60
+                )
+                resp.raise_for_status()
+                img_bytes = resp.content
+                b64 = base64.b64encode(img_bytes).decode('utf-8')
+                return jsonify({'image_base64': b64, 'provider': 'huggingface'})
+            except Exception as e:
+                print(f"HF Inference API error: {e}")
+        return jsonify({'error': 'No image generation provider configured'}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
