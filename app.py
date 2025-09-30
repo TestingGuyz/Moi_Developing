@@ -453,28 +453,29 @@ class KnowledgeDatabase:
 
 class ImageGenerator:
     """
-    Image generation using multiple backends:
-    1. Together.ai API (Stable Diffusion)
-    2. Pollinations.ai (Free alternative)
-    3. Hugging Face Inference API
+    Image generation using multiple FREE backends:
+    1. Pollinations.ai (Free, no API key needed)
+    2. Hugging Face Inference API (Free tier available)
+    3. AI for All (A4F) - Free API
+    4. OpenRouter (Has free models)
     """
     
     def __init__(self):
-        self.together_api_key = os.getenv('TOGETHER_API_KEY')
         self.hf_api_key = os.getenv('HUGGINGFACE_TOKEN')
+        self.openrouter_api_key = os.getenv('OPENROUTER_API_KEY')
         self.available_backends = self._check_available_backends()
         
         logger.info(f"Image generator initialized. Available backends: {self.available_backends}")
     
     def _check_available_backends(self) -> list:
         """Check which image generation backends are available"""
-        backends = ['pollinations']  # Always available (free)
-        
-        if self.together_api_key:
-            backends.append('together')
+        backends = ['pollinations', 'a4f']  # Always available (free, no API key)
         
         if self.hf_api_key:
             backends.append('huggingface')
+        
+        if self.openrouter_api_key:
+            backends.append('openrouter')
         
         return backends
     
@@ -498,38 +499,63 @@ class ImageGenerator:
     def _generate_with_backend(self, prompt: str, backend: str, size: str) -> Optional[bytes]:
         """Generate image with specific backend"""
         
-        if backend == 'together':
-            return self._generate_together(prompt, size)
+        if backend == 'pollinations':
+            return self._generate_pollinations(prompt, size)
+        elif backend == 'a4f':
+            return self._generate_a4f(prompt, size)
         elif backend == 'huggingface':
             return self._generate_huggingface(prompt, size)
-        elif backend == 'pollinations':
-            return self._generate_pollinations(prompt, size)
+        elif backend == 'openrouter':
+            return self._generate_openrouter(prompt, size)
         else:
             raise ValueError(f"Unknown backend: {backend}")
     
-    def _generate_together(self, prompt: str, size: str) -> Optional[bytes]:
-        """Generate image using Together.ai API"""
+    def _generate_a4f(self, prompt: str, size: str) -> Optional[bytes]:
+        """Generate image using AI for All (A4F) - Free API"""
         try:
-            if not self.together_api_key:
-                raise ValueError("Together.ai API key not found")
-            
-            logger.info(f"Generating image with Together.ai: {prompt[:50]}...")
+            logger.info(f"Generating image with A4F: {prompt[:50]}...")
             
             # Parse size
             width, height = map(int, size.split('x'))
             
-            url = "https://api.together.xyz/v1/images/generations"
+            # A4F uses simple GET request - completely free
+            # URL format: https://image.a4f.dev/generate?prompt={prompt}&width={width}&height={height}
+            
+            encoded_prompt = urllib.parse.quote(prompt)
+            url = f"https://image.a4f.dev/generate?prompt={encoded_prompt}&width={width}&height={height}"
+            
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            
+            return response.content
+            
+        except Exception as e:
+            logger.error(f"A4F error: {e}")
+            raise
+    
+    def _generate_openrouter(self, prompt: str, size: str) -> Optional[bytes]:
+        """Generate image using OpenRouter with free models"""
+        try:
+            if not self.openrouter_api_key:
+                raise ValueError("OpenRouter API key not found")
+            
+            logger.info(f"Generating image with OpenRouter: {prompt[:50]}...")
+            
+            # OpenRouter supports image generation through various models
+            # Using free tier models when available
+            
+            url = "https://openrouter.ai/api/v1/images/generations"
             headers = {
-                "Authorization": f"Bearer {self.together_api_key}",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {self.openrouter_api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://moi-ai.dev",  # Optional
+                "X-Title": "Moi AI Assistant"  # Optional
             }
             
             payload = {
-                "model": "stabilityai/stable-diffusion-xl-base-1.0",
+                "model": "stabilityai/stable-diffusion-2-1",  # Free model
                 "prompt": prompt,
-                "width": width,
-                "height": height,
-                "steps": 30,
+                "size": size,
                 "n": 1
             }
             
@@ -538,23 +564,18 @@ class ImageGenerator:
             
             result = response.json()
             
-            # Get image URL or base64
+            # Get image URL from response
             if 'data' in result and len(result['data']) > 0:
-                image_data = result['data'][0]
-                
-                if 'url' in image_data:
-                    # Download image from URL
-                    img_response = requests.get(image_data['url'], timeout=30)
+                image_url = result['data'][0].get('url')
+                if image_url:
+                    img_response = requests.get(image_url, timeout=30)
                     img_response.raise_for_status()
                     return img_response.content
-                elif 'b64_json' in image_data:
-                    # Decode base64
-                    return base64.b64decode(image_data['b64_json'])
             
             raise ValueError("No image data in response")
             
         except Exception as e:
-            logger.error(f"Together.ai error: {e}")
+            logger.error(f"OpenRouter error: {e}")
             raise
     
     def _generate_huggingface(self, prompt: str, size: str) -> Optional[bytes]:
