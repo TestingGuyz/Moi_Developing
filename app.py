@@ -18,6 +18,8 @@ import io
 from dotenv import load_dotenv
 import threading
 import time
+import uuid
+from typing import Dict, Any, List, Optional
 
 # Load environment variables
 load_dotenv()
