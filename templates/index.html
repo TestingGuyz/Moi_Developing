@@ -1982,6 +1982,9 @@
                         <button class="control-btn" id="improvePromptBtn" title="Improve Prompt">
                             <i class="fas fa-magic"></i>
                         </button>
+                        <button class="control-btn" id="imageGenBtn" title="Generate Image">
+                            <i class="fas fa-image"></i>
+                        </button>
                         <button class="control-btn" id="emojiBtn" title="Add Emoji">
                             <i class="fas fa-smile"></i>
                         </button>
@@ -3172,6 +3175,9 @@ function newChat() {
                                 <div style="font-size: 12px; color: var(--text-secondary); margin-top: 5px; line-height: 1.4;">
                                     ${detection.description || 'Click to get more information about this object'}
                                 </div>
+                                <div style="margin-top:8px; font-size:12px; color: var(--text-secondary);">
+                                    ${detection.known ? `<strong>Knowledge:</strong> ${formatKnowledgeSummary(detection.knowledge)}` : `<em>No knowledge yet. Auto-learning...</em>`}
+                                </div>
                                 <div style="display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;">
                                     ${webSearchEnabled ? `
                                         <button class="vision-btn secondary" style="font-size: 12px; padding: 4px 8px;" 
@@ -3187,6 +3193,12 @@ function newChat() {
                                             <i class="fas fa-seedling"></i> Growing Info
                                         </button>
                                     ` : ''}
+                                    <button class="vision-btn" style="font-size: 12px; padding: 4px 8px;" onclick="event.stopPropagation(); editKnowledge('${detection.class}')">
+                                        <i class="fas fa-book"></i> Edit Knowledge
+                                    </button>
+                                    <button class="vision-btn secondary" style="font-size: 12px; padding: 4px 8px;" onclick="event.stopPropagation(); addNote('${detection.class}')">
+                                        <i class="fas fa-sticky-note"></i> Add Note
+                                    </button>
                                 </div>
                             </div>
                         `;
@@ -3214,6 +3226,93 @@ function newChat() {
                 captionResult.innerHTML = '<div style="color: var(--error-color);">Failed to analyze frame</div>';
             }
         }
+
+        function formatKnowledgeSummary(knowledge) {
+            try {
+                if (!knowledge) return '';
+                const parts = [];
+                if (knowledge.color) parts.push(`Color: ${Array.isArray(knowledge.color) ? knowledge.color.join(', ') : knowledge.color}`);
+                if (knowledge.colors) parts.push(`Colors: ${knowledge.colors.slice(0,3).join(', ')}`);
+                if (knowledge.types) parts.push(`Types: ${knowledge.types.slice(0,3).join(', ')}${knowledge.types.length>3?'…':''}`);
+                if (knowledge.climate) parts.push(`Climate: ${Array.isArray(knowledge.climate) ? knowledge.climate.join(', ') : knowledge.climate}`);
+                if (knowledge.category) parts.push(`Category: ${knowledge.category}`);
+                if (knowledge.description) parts.push(`Desc: ${knowledge.description.slice(0,80)}${knowledge.description.length>80?'…':''}`);
+                return parts.join(' • ');
+            } catch (e) {
+                return '';
+            }
+        }
+
+        async function editKnowledge(objectName) {
+            const name = prompt(`Edit knowledge for: ${objectName}. Optionally rename:` , objectName) || objectName;
+            const desc = prompt('Description (leave blank to keep existing):', '') || undefined;
+            const color = prompt('Color(s) comma-separated (leave blank to keep):', '') || undefined;
+            const types = prompt('Types comma-separated (leave blank to keep):', '') || undefined;
+            const payload = {};
+            if (desc !== undefined) payload.description = desc;
+            if (color !== undefined && color.trim()) payload.colors = color.split(',').map(s=>s.trim()).filter(Boolean);
+            if (types !== undefined && types.trim()) payload.types = types.split(',').map(s=>s.trim()).filter(Boolean);
+            try {
+                const res = await fetch(`/knowledge/${encodeURIComponent(name)}`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.error) {
+                    showError(data.error);
+                } else {
+                    addMessage(`Knowledge updated for ${name}.`, 'ai');
+                }
+            } catch (e) {
+                showError(`Failed to update knowledge: ${e.message}`);
+            }
+        }
+
+        async function addNote(objectName) {
+            const note = prompt(`Add a note for ${objectName}:`);
+            if (!note) return;
+            try {
+                const res = await fetch(`/knowledge/${encodeURIComponent(objectName)}/notes`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ note })
+                });
+                const data = await res.json();
+                if (data.error) {
+                    showError(data.error);
+                } else {
+                    addMessage(`Saved note for ${objectName}.`, 'ai');
+                }
+            } catch (e) {
+                showError(`Failed to add note: ${e.message}`);
+            }
+        }
+
+        document.getElementById('imageGenBtn').addEventListener('click', async () => {
+            const promptText = prompt('Describe the image to generate:');
+            if (!promptText) return;
+            try {
+                addMessage(`🎨 Generating image for: "${promptText}"...`, 'user');
+                const res = await fetch('/generate-image', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt: promptText })
+                });
+                const data = await res.json();
+                if (data.error) {
+                    showError(data.error);
+                    return;
+                }
+                const imgHtml = `<div style="display:flex; flex-direction:column; gap:6px;">
+                    <img src="data:image/png;base64,${data.image_base64}" alt="Generated" style="max-width:100%; border-radius:8px;"/>
+                    <div style="font-size:12px; color: var(--text-secondary);">Provider: ${data.provider}</div>
+                </div>`;
+                addMessage(imgHtml, 'ai');
+            } catch (e) {
+                showError(`Image generation failed: ${e.message}`);
+            }
+        });
 
         function loadChatHistory() {
             chatHistory.forEach(msg => {
