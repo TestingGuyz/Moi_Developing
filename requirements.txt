@@ -1,0 +1,13 @@
+# Core dependencies (required)
+flask==2.3.3
+flask-cors==4.0.0
+requests==2.31.0
+numpy==1.24.3
+pillow==10.0.1
+python-dotenv==1.0.0
+
+# Optional AI/ML dependencies (install if you have API keys)
+torch>=2.0.0
+transformers>=4.30.0
+groq>=0.4.0
+tavily-python>=0.3.0
